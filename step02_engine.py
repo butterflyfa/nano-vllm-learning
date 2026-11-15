@@ -91,7 +91,7 @@ class Engine:
                 next_id = next_ids[row:row+1]
                 token_id = next_id.item()
                 req["cache"] = new_caches[row]
-                req["ids"] = torch.cat([req["ids"], next_id], dim = 1)
+                req["ids"] = torch.cat([req["ids"], next_id], dim = 1) # 要形状相同的向量进行拼接
                 req["generated_tokens"] += 1
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
