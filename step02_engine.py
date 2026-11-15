@@ -1,3 +1,5 @@
+from re import L
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.profiler import profile, ProfilerActivity
@@ -58,47 +60,58 @@ class Engine:
                 decode_ids.append(request_id) # decode阶段，后续做计算，cache不为空，输入为ids的最后一个token
 
 # ----------------- prefill ------------------
+        prefill_groups = {}
+
         for request_id in prefill_ids:
             req = self.requests[request_id]
-            ids = req["ids"]
+            length = req["ids"].shape
+            if length not in prefill_groups:
+                prefill_groups[length] = []
+            prefill_groups[length].append(request_id)
 
-            """
-             if req["cache"] is None:
-                input_ids = ids # prefill阶段，第一次做计算，cache为空，输入为整个ids
-            else:
-                input_ids = ids[:, -1:]  # decode阶段，后续做计算，cache不为空，输入为ids的最后一个token
-            """
+            for group in prefill_groups.values():
+                prompts = []
 
-            input_ids = ids
-            print("请求", request_id, "本轮输入长度", input_ids.shape[1])
-            with torch.profiler.record_function("model_inference"):
-                out = self.model(input_ids = input_ids, use_cache=True, past_key_values=req["cache"])
-            req["cache"] = out.past_key_values # 每轮都把刚刚计算好的kv加入缓存中
-            next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                for request_id in group:
+                    ids = self.requests[request_id]["ids"]
+                    prompts.append(ids)
+                input_ids = torch.cat(prompts,dim = 0)
+                # 把所有请求都拼成一个input
+                with torch.profiler.recode_function("model_inference"):
+                    out = model(
+                        input_ids = input_ids,
+                        use_cache = True
+                    )
 
-            req["ids"] = torch.cat([ids, next_id], dim = 1)
-            req["generated_tokens"] += 1
+                next_ids = out.logits[:,-1,:].argmax(dim = -1, keepdim = True)
+                new_caches = out.past_key_values.batch_split(len(group), 1)
 
-            token_id = next_id.item()
-            req["finished"] = token_id in stop_ids
-                # 创建了finished键，表示是否生成了结束符
-            update[request_id] = token_id
+                for row, request_id in enumerate(group):
+                    req = self.requests[request_id]
+                    next_id = next_ids[row:row+1]
+                    next_token = next_id.item()
+                    req["cache"] = new_caches[row]
+                    req["ids"] = torch.cat((req["ids"], next_token), dim = 1)
+                    req["generated_tokens"] += 1
+                    req["finished"] = token_id in stop_ids
+                    update[request_id] = token_id
 
 
 # ----------------- decode ------------------
-        groups = {} # 键：缓存长度  值：request_id,请求id
+# 按长度进行划分
+        decode_groups = {} # 键：缓存长度  值：request_id,请求id
         for request_id in decode_ids:
             cache = self.requests[request_id]["cache"]
             length = cache.get_seq_length()
-            if length not in groups:
-                groups[length] = [] # 第一次遇到这个长度时，为它新建一个列表
-            groups[length].append(request_id)
+            if length not in decode_groups:
+                decode_groups[length] = [] # 第一次遇到这个长度时，为它新建一个列表
+            decode_groups[length].append(request_id)
 
-        for group in groups.values():
+        for group in decode_groups.values(): # 每次取一组请求编号
             tokens = [] # 存每个请求最新的一个token，也就是每个请求新一轮的输入
             caches = []
 
-            for request_id in group:
+            for request_id in group: # 把已输出相同长度的请求放一组
                 req = self.requests[request_id]
                 tokens.append(req["ids"][:,-1:]) # 只取最后一个token，要取出这个token作为下一轮的输入
                 caches.append(req["cache"])
@@ -133,6 +146,7 @@ class Engine:
                 req["generated_tokens"] += 1
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
+
                 
         return update
 
@@ -150,9 +164,3 @@ def profile_decode(model, tokenizer):
 
     with profile(activities=activities, record_shapes=True) as prof:
         updates = engine.step()
-
-    print("本轮生成结果：", updates)
-    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=15))
-
-
-# test   11.15
