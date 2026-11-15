@@ -69,32 +69,32 @@ class Engine:
                 prefill_groups[length] = []
             prefill_groups[length].append(request_id)
 
-            for group in prefill_groups.values():
-                prompts = []
+        for group in prefill_groups.values():
+            prompts = []
 
-                for request_id in group:
-                    ids = self.requests[request_id]["ids"]
-                    prompts.append(ids)
-                input_ids = torch.cat(prompts,dim = 0)
-                # 把所有请求都拼成一个input
-                with torch.profiler.recode_function("model_inference"):
-                    out = model(
-                        input_ids = input_ids,
-                        use_cache = True
-                    )
+            for request_id in group:
+                ids = self.requests[request_id]["ids"]
+                prompts.append(ids)
+            input_ids = torch.cat(prompts,dim = 0)
+            # 把所有请求都拼成一个input
+            with torch.profiler.record_function("model_inference"):
+                out = self.model(
+                    input_ids = input_ids,
+                    use_cache = True
+                )
 
-                next_ids = out.logits[:,-1,:].argmax(dim = -1, keepdim = True)
-                new_caches = out.past_key_values.batch_split(len(group), 1)
+            next_ids = out.logits[:,-1,:].argmax(dim = -1, keepdim = True)
+            new_caches = out.past_key_values.batch_split(len(group), 1)
 
-                for row, request_id in enumerate(group):
-                    req = self.requests[request_id]
-                    next_id = next_ids[row:row+1]
-                    next_token = next_id.item()
-                    req["cache"] = new_caches[row]
-                    req["ids"] = torch.cat((req["ids"], next_token), dim = 1)
-                    req["generated_tokens"] += 1
-                    req["finished"] = token_id in stop_ids
-                    update[request_id] = token_id
+            for row, request_id in enumerate(group):
+                req = self.requests[request_id]
+                next_id = next_ids[row:row+1]
+                token_id = next_id.item()
+                req["cache"] = new_caches[row]
+                req["ids"] = torch.cat([req["ids"], next_id], dim = 1)
+                req["generated_tokens"] += 1
+                req["finished"] = token_id in stop_ids
+                update[request_id] = token_id
 
 
 # ----------------- decode ------------------
@@ -122,7 +122,7 @@ class Engine:
             batch_cache = DynamicCache.from_batch_splits(caches)
             # 按同样的行顺序合并KV缓存
 
-            with torch.profiler.recode_function("model_inference"):
+            with torch.profiler.record_function("model_inference"):
                 out = self.model(
                     input_ids = input_ids, # 形状[请求数，1]，每行对应一个请求，每行输入一个token
                     use_cache = True, # 保留本次输入的KV，存到past_key_values中
@@ -150,6 +150,7 @@ class Engine:
                 
         return update
 
+"""
 def profile_decode(model, tokenizer):
     engine = Engine(model, tokenizer)
     engine.add_request("The capital of France is", max_new_tokens=16)
@@ -164,3 +165,22 @@ def profile_decode(model, tokenizer):
 
     with profile(activities=activities, record_shapes=True) as prof:
         updates = engine.step()
+"""
+
+if __name__ == "__main__":
+    engine = Engine(model, tokenizer)
+    a = engine.add_request("The capital of France is", max_new_tokens=2)
+    b = engine.add_request("The capital of Germany is", max_new_tokens=3)
+
+    # 模型每次运行前，打印这次输入的形状：[请求数, 每条请求输入的 token 数]
+    def show_input(module, args, kwargs):
+        print("  模型输入形状：", tuple(kwargs["input_ids"].shape))
+
+    hook = model.register_forward_pre_hook(show_input, with_kwargs=True)
+
+    for step_num in range(1, 5):
+        print(f"第 {step_num} 轮")
+        updates = engine.step()
+        print("  本轮输出：", updates)
+
+    hook.remove()
