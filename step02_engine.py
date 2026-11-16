@@ -165,6 +165,8 @@ class Engine:
             reached_limit = req["generated_tokens"] >= req["max_new_tokens"] # 判断是否要把这个请求移除
             if not reached_limit and not req.get("finished",False):
                 still_running.append(request_id)
+            else:
+                req["cache"] = None
 
         self.running = still_running
 
