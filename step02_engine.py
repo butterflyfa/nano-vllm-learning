@@ -13,12 +13,19 @@ model = AutoModelForCausalLM.from_pretrained(model_id).to(device).eval()
 # 加载模型权重，移到设备上，切换到评估模式
 
 class Engine:
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, max_running = 2):
         self.model = model
         self.tokenizer = tokenizer
         self.requests = {} # 按编号保存请求
         # requests是一个字典，key是请求编号，value是请求的内容（一个字典）
         self.next_request_id = 0
+        if max_running < 1:
+            raise ValueError("最大值至少为1")
+        self.max_running = max_running
+        self.waiting = [] # 已提交，等空位的请求编号,不管是decode还是prefill
+        self.running = [] # 已获准运行的请求编号
+        
+
 
     def add_request(self, text, max_new_tokens): # 作用是把每个请求存起来
         request_id = self.next_request_id
@@ -33,10 +40,15 @@ class Engine:
             "generated_tokens" : 0,
             "cache" : None,
         }
+        if max_new_tokens > 0:
+            self.waiting.append(request_id)
         return request_id
 
     @torch.inference_mode() # 关闭梯度记录，节省内存
     def step(self): # 用于生成每个请求的下一个token
+        while self.waiting and len(self.running) < self.max_running:
+            request_id = self.waiting.pop(0) # 取出并删除列表中位置为0的元素
+            self.running.append(request_id)
         update = {}
         eos = self.model.generation_config.eos_token_id
         stop_ids = {eos} if isinstance(eos, int) else set(eos or [])
@@ -44,7 +56,7 @@ class Engine:
         prefill_ids = []
         decode_ids = []
 
-        for request_id in self.requests: # 遍历的是请求
+        for request_id in self.running: # 遍历的是请求
             req = self.requests[request_id]
             # 如果加了item()能保证每次都能取到一对键和值,也就是对应第18行的结构
             # 不加item()的话，request_id就是一个编号
@@ -98,7 +110,6 @@ class Engine:
 
 
 # ----------------- decode ------------------
-# 按长度进行划分
         decode_groups = {} # 键：缓存长度  值：request_id,请求id
         for request_id in decode_ids:
             cache = self.requests[request_id]["cache"]
@@ -147,7 +158,16 @@ class Engine:
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
 
-                
+# ----------------- judege ------------------
+        still_running = []
+        for request_id in self.running:
+            req = self.requests[request_id]
+            reached_limit = req["generated_tokens"] >= req["max_new_tokens"] # 判断是否要把这个请求移除
+            if not reached_limit and not req.get("finished",False):
+                still_running.append(request_id)
+
+        self.running = still_running
+
         return update
 
 """
