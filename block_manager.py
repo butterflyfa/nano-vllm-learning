@@ -85,6 +85,28 @@ class PagedKVCache:
 
         return keys, values
                 
+    @torch.no_grad()
+    def write_from_cache(self, request_id, source_cache, block_manager):
+        num_tokens = source_cache.get_seq_length()
+
+        block_manager.ensure_capacity(request_id, num_tokens)
+
+        for layer_id in range(len(source_cache.key_cache)):
+            keys = source_cache.key_cache[layer_id]
+            # source_cache.key_cache  列表，每项是一层的 K 张量
+            values = source_cache.cache_cache[layer_id]
+
+            if keys.shape[0] != 1:
+                raise ValueError("这个方法每次接收一条请求的缓存")
+
+            for position in range(num_tokens):
+                block_id, offset = block_manager.get_slot(request_id, position)
+
+                key = keys[0, :, position, :]
+                value = values[0, :, position, :]
+
+                self.write(layer_id, block_id, offset, value)
+
 
         
 
