@@ -1,4 +1,3 @@
-from httpcore import request
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.profiler import profile, ProfilerActivity
@@ -6,31 +5,33 @@ from block_manager import BlockManager, PagedKVCache
 from model_runner import decode_batch
 
 
-model_id = "Qwen/Qwen3-0.6B"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-dtype = torch.bfloat16 if device == "cuda" else torch.float32
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype = dtype).to(device).eval()
-# 加载模型权重，移到设备上，切换到评估模式
+def load_model(model_id="Qwen/Qwen3-0.6B"):
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+    return model, tokenizer
+
 
 class Engine:
-    def __init__(self, model, tokenizer, max_running = 2,
-                 num_blocks = 64, block_size = 16):
+    """支持 Continuous Batching 与 PagedKVCache 的轻量级推理调度引擎。"""
+
+    def __init__(self, model, tokenizer, max_running=2, num_blocks=64, block_size=16):
+        if max_running < 1:
+            raise ValueError("max_running 至少为 1")
+
         self.model = model
         self.tokenizer = tokenizer
-        self.requests = {} # 按编号保存请求
-        # requests是一个字典，key是请求编号，value是请求的内容（一个字典）
-        self.next_request_id = 0
-        if max_running < 1:
-            raise ValueError("最大值至少为1")
         self.max_running = max_running
-        self.waiting = [] # 已提交，等空位的请求编号,不管是decode还是prefill
-        self.running = [] # 已获准运行的请求编号
+
+        self.requests = {}  # {request_id: 请求状态字典}
+        self.next_request_id = 0
+        self.waiting = []   # 等待调度的请求 ID 队列
+        self.running = []   # 当前并发执行中的请求 ID 列表
 
         self.block_manager = BlockManager(num_blocks, block_size)
-        # 记录具体请求用哪些块
         first_attn = model.model.layers[0].self_attn
-
         self.paged_cache = PagedKVCache(
             num_layers=len(model.model.layers),
             num_blocks=num_blocks,
@@ -39,155 +40,141 @@ class Engine:
             head_dim=first_attn.head_dim,
             device=model.device,
             dtype=first_attn.k_proj.weight.dtype,
-            )
-        # 记录块中实际存放的KV数值
+        )
 
-
-    def add_request(self, text, max_new_tokens): # 作用是把每个请求存起来
+    def add_request(self, text, max_new_tokens):
+        """编码提示词并注册新请求，加入 waiting 等待队列。"""
         request_id = self.next_request_id
         self.next_request_id += 1
 
-        inputs = self.tokenizer(text, return_tensors = "pt").to(self.model.device)
-        # 将输入文本编码为token ID张量，并移到模型所在的设备上
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         self.requests[request_id] = {
-            "ids" : inputs.input_ids,
-            # inputs是一个字典，里面有input_ids、attention_mask等键值对
-            "max_new_tokens" : max_new_tokens,
-            "generated_tokens" : 0,
-            "cached_tokens" : 0,
+            "ids": inputs.input_ids,          # [1, seq_len]，包含提示词与后续生成的 token
+            "max_new_tokens": max_new_tokens,
+            "generated_tokens": 0,            # 已生成的续写 token 数（用于停止条件判断）
+            "cached_tokens": 0,               # 已写入 PagedKVCache 的 token 数（用于计算 position）
         }
         if max_new_tokens > 0:
             self.waiting.append(request_id)
         return request_id
 
-    @torch.inference_mode() # 关闭梯度记录，节省内存
-    def step(self): # 用于生成每个请求的下一个token
+    @torch.inference_mode()
+    def step(self):
+        """推进一轮调度与推理：准入 -> Prefill / Decode 分流执行 -> 完成回收。"""
         while self.waiting and len(self.running) < self.max_running:
-            request_id = self.waiting.pop(0) # 取出并删除列表中位置为0的元素
+            request_id = self.waiting.pop(0)
             self.running.append(request_id)
+
         update = {}
         eos = self.model.generation_config.eos_token_id
         stop_ids = {eos} if isinstance(eos, int) else set(eos or [])
-        # active = []
+
         prefill_ids = []
         decode_ids = []
-
-        for request_id in self.running: # 遍历的是请求
+        for request_id in self.running:
             req = self.requests[request_id]
-            # 如果加了item()能保证每次都能取到一对键和值,也就是对应第18行的结构
-            # 不加item()的话，request_id就是一个编号
             if req["generated_tokens"] >= req["max_new_tokens"] or req.get("finished", False):
-                continue # 跳过这次请求，去生成下一个请求的token
+                continue
 
-            # active.append(request_id) # 记录本轮需要生成token的请求编号
-            # 用prefill和decode区分的更加清晰
-
-            if req["cached_tokens"] == 0 :
-                prefill_ids.append(request_id) # prefill阶段，第一次做计算，cache为空，输入为整个ids
+            if req["cached_tokens"] == 0:
+                prefill_ids.append(request_id)
             else:
-                decode_ids.append(request_id) # decode阶段，后续做计算，cache不为空，输入为ids的最后一个token
+                decode_ids.append(request_id)
 
-# ----------------- prefill ------------------
+        # ----------------- 1. Prefill 阶段 ------------------
         prefill_groups = {}
-
         for request_id in prefill_ids:
-            req = self.requests[request_id]
-            length = req["ids"].shape[1]
-            if length not in prefill_groups:
-                prefill_groups[length] = []
-            prefill_groups[length].append(request_id)
+            length = self.requests[request_id]["ids"].shape[1]
+            prefill_groups.setdefault(length, []).append(request_id)
 
         for group in prefill_groups.values():
-            prompts = []
+            prompts = [self.requests[rid]["ids"] for rid in group]
+            input_ids = torch.cat(prompts, dim=0)  # [group_size, prompt_len]
 
-            for request_id in group:
-                ids = self.requests[request_id]["ids"]
-                prompts.append(ids)
-            input_ids = torch.cat(prompts,dim = 0)
-            # 把所有请求都拼成一个input
-            with torch.profiler.record_function("model_inference"):
-                out = self.model(
-                    input_ids = input_ids,
-                    use_cache = True
-                )
+            with torch.profiler.record_function("model_prefill"):
+                out = self.model(input_ids=input_ids, use_cache=True)
 
-            next_ids = out.logits[:,-1,:].argmax(dim = -1, keepdim = True)
+            next_ids = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [group_size, 1]
             new_caches = out.past_key_values.batch_split(len(group), 1)
 
             for row, request_id in enumerate(group):
                 req = self.requests[request_id]
+                # 在追加新预测词前记录提示词长度：此时仅提示词的 K/V 已完成计算并写入分页缓存
                 prompt_len = req["ids"].shape[1]
                 self.paged_cache.write_from_cache(request_id, new_caches[row], self.block_manager)
                 req["cached_tokens"] = prompt_len
 
-                next_id = next_ids[row:row+1]
+                next_id = next_ids[row : row + 1]
                 token_id = next_id.item()
-                
-                req["ids"] = torch.cat([req["ids"], next_id], dim = 1) # 要形状相同的向量进行拼接
+                req["ids"] = torch.cat([req["ids"], next_id], dim=1)
                 req["generated_tokens"] += 1
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
 
-
-# ----------------- decode ------------------
-        if decode_ids:  # 注意一定要加 if 判断，因为第 1 轮 decode_ids 是空列表！
+        # ----------------- 2. Decode 阶段 ------------------
+        if decode_ids:
             tokens = []
             positions = []
             for request_id in decode_ids:
                 req = self.requests[request_id]
-                tokens.append(req["ids"][:, -1:]) # 只取最后一个还没算过kv的token
-                positions.append(req["cached_tokens"])
+                tokens.append(req["ids"][:, -1:])       # 取最新待编码的 1 个 token，保持 [1, 1]
+                positions.append(req["cached_tokens"])  # 当前 token 在整条序列中的下标位置
 
-            input_ids = torch.cat(tokens, dim = 0)
+            input_ids = torch.cat(tokens, dim=0)        # [B, 1]，不同长度的请求合并为一个 Batch
 
-            with torch.profiler.record_function("model_inference"):
+            with torch.profiler.record_function("model_decode"):
                 logits = decode_batch(
-                    model = self.model,
+                    model=self.model,
                     input_ids=input_ids,
                     request_ids=decode_ids,
                     positions=positions,
-                    cache = self.paged_cache,
+                    cache=self.paged_cache,
                     block_manager=self.block_manager,
                 )
-            next_ids = logits[:,-1,:].argmax(dim=-1, keepdim = True)
+            next_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [B, 1]
 
             for row, request_id in enumerate(decode_ids):
                 req = self.requests[request_id]
                 next_id = next_ids[row : row + 1]
                 token_id = next_id.item()
+
                 req["ids"] = torch.cat([req["ids"], next_id], dim=1)
                 req["cached_tokens"] += 1
                 req["generated_tokens"] += 1
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
 
-
-# ----------------- judege ------------------
+        # ----------------- 3. Postprocess 回收阶段 ------------------
         still_running = []
         for request_id in self.running:
             req = self.requests[request_id]
-            reached_limit = req["generated_tokens"] >= req["max_new_tokens"] # 判断是否要把这个请求移除
-            if not reached_limit and not req.get("finished",False):
+            reached_limit = req["generated_tokens"] >= req["max_new_tokens"]
+            if not reached_limit and not req.get("finished", False):
                 still_running.append(request_id)
             else:
                 self.block_manager.release(request_id)
 
         self.running = still_running
-
         return update
 
-if __name__ == "__main__":
-    engine = Engine(model, tokenizer)
-    a = engine.add_request("The capital of France is", max_new_tokens=2)
-    b = engine.add_request("The capital of Germany is", max_new_tokens=3)
 
-    # 模型每次运行前，打印这次输入的形状：[请求数, 每条请求输入的 token 数]
+if __name__ == "__main__":
+    model, tokenizer = load_model()
+    engine = Engine(model, tokenizer)
+    a = engine.add_request("The capital of France is", max_new_tokens=3)
+    b = engine.add_request("In Europe, the capital city of Germany is", max_new_tokens=4)
+
     def show_input(module, args, kwargs):
-        print("  模型输入形状：", tuple(kwargs["input_ids"].shape))
+        print("  Prefill 模型输入形状：", tuple(kwargs["input_ids"].shape))
 
     hook = model.register_forward_pre_hook(show_input, with_kwargs=True)
 
-    for step_num in range(1, 5):
+    for step_num in range(1, 6):
         print(f"第 {step_num} 轮")
         updates = engine.step()
         print("  本轮输出：", updates)
+
+    hook.remove()
+    print("请求 a 生成结果：", tokenizer.decode(engine.requests[a]["ids"][0], skip_special_tokens=True))
+    print("请求 b 生成结果：", tokenizer.decode(engine.requests[b]["ids"][0], skip_special_tokens=True))
+    print("结束后空闲物理块数：", len(engine.block_manager.free_blocks))
