@@ -5,7 +5,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.profiler import profile, ProfilerActivity
 from block_manager import BlockManager, PagedKVCache
 import block_manager
-from model_runner import decode_one_token
+from model_runner import decode_batch
 
 
 model_id = "Qwen/Qwen3-0.6B"
@@ -132,28 +132,36 @@ class Engine:
 
 
 # ----------------- decode ------------------
-        for request_id in decode_ids:
-            req = self.requests[request_id]
-            input_ids = req["ids"][:, -1:] # 只取最后一个还没算过kv的token
-            position = req["cached_tokens"]
+        if decode_ids:  # 注意一定要加 if 判断，因为第 1 轮 decode_ids 是空列表！
+            tokens = []
+            positions = []
+            for request_id in decode_ids:
+                req = self.requests[request_id]
+                tokens.append(req["ids"][:, -1:]) # 只取最后一个还没算过kv的token
+                positions.append(["cached_tokens"])
+
+            input_ids = torch.cat(tokens, dim = 0)
 
             with torch.profiler.record_function("model_inference"):
-                logits = decode_one_token(
+                logits = decode_batch(
                     model = self.model,
                     input_ids=input_ids,
-                    request_id=request_id,
-                    position=position,
+                    request_ids=request_ids,
+                    positions=positions,
                     cache = self.paged_cache,
                     block_manager=self.block_manager,
                 )
-            next_id = logits[:,-1,:].argmax(dim=-1, keepdim = True)
-            token_id = next_id.item()
+            next_ids = logits[:,-1,:].argmax(dim=-1, keepdim = True)
 
-            req["ids"] = torch.cat([req["ids"], next_id], dim = 1)
-            req["cached_tokens"] += 1
-            req["generated_tokens"] += 1
-            req["finished"] = token_id in stop_ids
-            update[request_id] = token_id
+            for row, request_id in enumerate(decode_ids):
+                req = self.requests[request_id]
+                next_id = next_ids[row : row + 1]
+                token_id = next_id.item()
+                req["ids"] = torch.cat([req["ids"], next_id], dim=1)
+                req["cached_tokens"] += 1
+                req["generated_tokens"] += 1
+                req["finished"] = token_id in stop_ids
+                update[request_id] = token_id
 
 
 # ----------------- judege ------------------

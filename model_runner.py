@@ -2,7 +2,7 @@ import torch
 from attention import decode_attention_layer
 
 @torch.inference_mode()
-def decode_layer(model, hidden_states, layer_id, request_id, position, cache, block_manager):
+def decode_layer(model, hidden_states, layer_id, request_ids, positions, cache, block_manager):
 
     layer = model.model.layers[layer_id]
     residual = hidden_states
@@ -13,8 +13,8 @@ def decode_layer(model, hidden_states, layer_id, request_id, position, cache, bl
         model=model,
         hidden_states=hidden_states,
         layer_id=layer_id,
-        request_id=request_id,
-        position=position,
+        request_id=request_ids,
+        position=positions,
         cache=cache,
         block_manager=block_manager,
     )
@@ -32,9 +32,8 @@ def decode_layer(model, hidden_states, layer_id, request_id, position, cache, bl
 
     return hidden_states
 
-
 @torch.inference_mode()
-def decode_one_token(model, input_ids, request_id, position, cache, block_manager):
+def decode_one_token(model, input_ids, request_ids, positions, cache, block_manager):
 
     hidden_states = model.model.embed_tokens(input_ids)
     num_layers = len(model.model.layers)
@@ -46,8 +45,8 @@ def decode_one_token(model, input_ids, request_id, position, cache, block_manage
             model=model,
             hidden_states=hidden_states,
             layer_id=layer_id,
-            request_id=request_id,
-            position=position,
+            request_id=request_ids,
+            position=positions,
             cache=cache,
             block_manager=block_manager,
         )
