@@ -1,4 +1,6 @@
+from click import launch
 import torch
+from transformers import DynamicCache
 
 
 class BlockManager:
@@ -36,7 +38,7 @@ class BlockManager:
         if position < 0:
             raise ValueError("Token的位置不能小于0")
 
-        blocks = self.block_tables[request_id] # paged attention，逻辑块和物理块之间的映射
+        blocks = self.block_tables[request_id] 
 
         logical_block = position // self.block_size
         offset = position % self.block_size
@@ -47,7 +49,25 @@ class BlockManager:
         block_id = blocks[logical_block]
         return block_id, offset
 
+    def get_slots(self, request_id, num_tokens, device): # 减少每次查找所有词的计算
+        if num_tokens < 0:
+            raise ValueError("Token 的数量不能小于 0")
+        if num_tokens == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty
 
+        blocks = self.block_tables.get(request_id, [])
+        needed = (num_tokens + self.block_size - 1) // self.block_size
+        if needed > len(blocks):
+            raise ValueError("这个请求还没有分配足够的缓存块")
+
+        positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+        block_table = torch.tensor(blocks, dtype=torch.long, device=device)
+
+        block_ids = block_table[positions // self.block_size]
+        offsets = positions % self.block_size
+        return block_ids, offsets    
+    
 class PagedKVCache:
     def __init__(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, device, dtype=torch.float32):
 
@@ -68,20 +88,10 @@ class PagedKVCache:
         value_slot.copy_(value)
 
     def read(self, layer_id, request_id, num_tokens, block_manager):
-        if num_tokens < 0:
-            raise ValueError("读取的 token 数不能小于 0")
-        
-        num_kv_heads, head_dim = self.key_cache.shape[-2:] # 表示从倒数第二项开始，一直取到末尾
+        block_ids, offsets = block_manager.get_slots(request_id, num_tokens, device=self.key_cache.device)
 
-        shape = (num_tokens, num_kv_heads, head_dim)
-        keys = self.key_cache.new_empty(shape) # 使用与缓存相同的设备和数据类型
-        values = self.value_cache.new_empty(shape)
-
-        for position in range(num_tokens):
-            block_id, offset = block_manager.get_slot(request_id, position)
-
-            keys[position].copy_(self.key_cache[layer_id, block_id, offset])
-            values[position].copy_(self.value_cache[layer_id, block_id, offset])
+        keys = self.key_cache[layer_id, block_ids, offsets]
+        values = self.value_cache[layer_id, block_ids, offsets]
 
         return keys, values
                 
@@ -91,24 +101,34 @@ class PagedKVCache:
 
         block_manager.ensure_capacity(request_id, num_tokens)
 
+        block_ids, offsets = block_manager.get_slots(
+            request_id, num_tokens, device=self.key_cache.device
+        )
+
         for layer_id in range(len(source_cache.key_cache)):
             keys = source_cache.key_cache[layer_id]
             # source_cache.key_cache  列表，每项是一层的 K 张量
-            values = source_cache.cache_cache[layer_id]
+            values = source_cache.value_cache[layer_id]
 
             if keys.shape[0] != 1:
                 raise ValueError("这个方法每次接收一条请求的缓存")
 
-            for position in range(num_tokens):
-                block_id, offset = block_manager.get_slot(request_id, position)
+            self.key_cache[layer_id, block_ids, offsets] = keys[0].transpose(0, 1)
+            self.value_cache[layer_id, block_ids, offsets] = values[0].transpose(0, 1)
 
-                key = keys[0, :, position, :]
-                value = values[0, :, position, :]
+    @torch.no_grad()
+    def to_dynamic_cache(self, request_id, num_tokens, block_manager):
+        result = DynamicCache()
+        num_layers = self.key_cache.shape[0]
 
-                self.write(layer_id, block_id, offset, value)
+        for layer_id in range(num_layers):
+            keys, values = self.read(
+                layer_id, request_id, num_tokens, block_manager
+            )
 
+            keys = keys.transpose(0,1).unsqueeze(0)
+            values = values.transpose(0, 1).unsqueeze(0)
+            # [请求数, KV头数, token数, 头维度]
 
-        
-
-
-
+            result.update(keys, values, layer_id)
+        return result
