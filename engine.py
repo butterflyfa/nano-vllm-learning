@@ -185,5 +185,3 @@ if __name__ == "__main__":
         print(f"第 {step_num} 轮")
         updates = engine.step()
         print("  本轮输出：", updates)
-
-    hook.remove()
