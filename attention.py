@@ -1,3 +1,4 @@
+from numpy import block
 import torch
 
 @torch.inference_mode()
@@ -104,61 +105,58 @@ def apply_rope(query, key, cos, sin):
     return query_rotated, key_rotated
 
 @torch.inference_mode()
-def get_rope_cos_sin(model, hidden_states, start_position):
-    # start_position：本轮第一个 token 在整条序列中的位置，从 0 开始
+def get_rope_cos_sin(model, hidden_states, positions):
+    # positions为列表 存放的是每条请求当前词的位置下标
 
     seq_len = hidden_states.shape[1]
 
-    position_ids = torch.arange(
-        start_position,
-        start_position + seq_len,
-        device=hidden_states.device,
+    position_ids = torch.tensor(
+        positions, dtype=torch.long,device=hidden_states.device
     )
 
-    position_ids = position_ids.unsqueeze(0)
+    position_ids = position_ids.unsqueeze(1)
 
     cos, sin = model.model.rotary_emb(hidden_states, position_ids)
     return cos, sin
 
 @torch.inference_mode()
-def decode_attention_layer(model, hidden_states, layer_id, request_id, position, cache, block_manager):
-    # hidden_states 是这个函数的输入，但它是 token 的特征向量，不是原始文字或 token 编号
+def decode_attention_layer(model, hidden_states, layer_id, request_ids, positions, cache, block_manager):
+
+    batch_size = len(request_ids)
     attn = model.model.layers[layer_id].self_attn
     # attn 是 Qwen 某一层的 attention 模块对象，里面包含这一层计算 attention 所需的权重和配置
 
 
     query, key, value = project_qkv(attn, hidden_states)
-    cos, sin = get_rope_cos_sin(model, hidden_states, position)
+    cos, sin = get_rope_cos_sin(model, hidden_states, positions)
 
     query, key = apply_rope(query, key, cos, sin)
 
-    num_tokens = position + 1
+    block_ids = []
+    offsets = []
+    for request_id, pos in zip(request_ids, positions):
+        block_manager.ensure_capacity(request_id, pos+1)
+        b_id, off = block_manager.get_slot(request_id, pos)
+        block_ids.append(b_id)
+        offsets.append(off)
 
-    block_manager.ensure_capacity(request_id, num_tokens)
-    # 确保这个请求有足够的缓存块
+    block_ids_t = torch.tensor(block_ids, dtype=torch.long, device=hidden_states.device)
+    offsets_t = torch.tensor(offsets, dtype=torch.long, device=hidden_states.device)
+    cache.key_cache[layer_id, block_ids_t, offsets_t] = key[:, 0]
+    cache.value_cache[layer_id, block_ids_t, offsets_t] = value[:, 0]
 
-    block_id, offset = block_manager.get_slot(request_id, position)
-    # 找到当前 token 对应的物理块和块内位置
+    outputs = []
+    for row, (request_id, pos) in enumerate(zip(request_ids, positions)):
+        out_i = decode_attention(
+            query[row, 0],  # 第 row 条请求的 Q：[Q头数, 头维度]
+            cache,
+            block_manager,
+            layer_id,
+            request_id,
+            pos + 1,        # 该请求参与 attention 的总词数
+        )
+        outputs.append(out_i)
 
-    cache.write(
-        layer_id,
-        block_id,
-        offset,
-        key[0, 0],    # [KV头数, 头维度]，已经做过 RoPE
-        value[0, 0],  # [KV头数, 头维度]
-    )
-
-    output = decode_attention(
-        query[0, 0],  # [Q头数, 头维度]
-        cache,
-        block_manager,
-        layer_id,
-        request_id,
-        num_tokens,
-    )    
-
-    output = output.reshape(1, 1, -1)
+    output = torch.stack(outputs, dim=0).reshape(batch_size, 1, -1)
     output = attn.o_proj(output)
-    # output 是token在这一层经过atten后得到的张量,还不是最终的next_tensor
-
     return output
