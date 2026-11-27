@@ -1,10 +1,8 @@
-from turtle import position
-
+from httpcore import request
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.profiler import profile, ProfilerActivity
 from block_manager import BlockManager, PagedKVCache
-import block_manager
 from model_runner import decode_batch
 
 
@@ -138,7 +136,7 @@ class Engine:
             for request_id in decode_ids:
                 req = self.requests[request_id]
                 tokens.append(req["ids"][:, -1:]) # 只取最后一个还没算过kv的token
-                positions.append(["cached_tokens"])
+                positions.append(req["cached_tokens"])
 
             input_ids = torch.cat(tokens, dim = 0)
 
@@ -146,7 +144,7 @@ class Engine:
                 logits = decode_batch(
                     model = self.model,
                     input_ids=input_ids,
-                    request_ids=request_ids,
+                    request_ids=decode_ids,
                     positions=positions,
                     cache = self.paged_cache,
                     block_manager=self.block_manager,
