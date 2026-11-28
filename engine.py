@@ -2,7 +2,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.profiler import profile, ProfilerActivity
 from block_manager import BlockManager, PagedKVCache
-from model_runner import decode_batch
+from model_runner import decode_batch, prefill_batch
 
 
 def load_model(model_id="Qwen/Qwen3-0.6B"):
@@ -82,34 +82,37 @@ class Engine:
                 decode_ids.append(request_id)
 
         # ----------------- 1. Prefill 阶段 ------------------
-        prefill_groups = {}
-        for request_id in prefill_ids:
-            length = self.requests[request_id]["ids"].shape[1]
-            prefill_groups.setdefault(length, []).append(request_id)
+        if prefill_ids:
+            prompts = []
+            seq_lens = []
+            for request_id in prefill_ids:
+                ids = self.requests[request_id]["ids"]
+                prompts.append(ids)
+                seq_lens.append(ids.shape[1])
 
-        for group in prefill_groups.values():
-            prompts = [self.requests[rid]["ids"] for rid in group]
-            input_ids = torch.cat(prompts, dim=0)  # [group_size, prompt_len]
+            input_ids = torch.cat(prompts, dim = 1)
 
             with torch.profiler.record_function("model_prefill"):
-                out = self.model(input_ids=input_ids, use_cache=True)
+                logits = prefill_batch(
+                 model=self.model,
+                 input_ids=input_ids,
+                 request_ids=prefill_ids,
+                 seq_lens=seq_lens,
+                 cache=self.paged_cache,
+                 block_manager=self.block_manager,
+             )
+            next_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [B, 1]
 
-            next_ids = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [group_size, 1]
-            new_caches = out.past_key_values.batch_split(len(group), 1)
-
-            for row, request_id in enumerate(group):
+            for row, (request_id ,prompt_len) in enumerate(zip(prefill_ids, seq_lens)):
                 req = self.requests[request_id]
-                # 在追加新预测词前记录提示词长度：此时仅提示词的 K/V 已完成计算并写入分页缓存
-                prompt_len = req["ids"].shape[1]
-                self.paged_cache.write_from_cache(request_id, new_caches[row], self.block_manager)
                 req["cached_tokens"] = prompt_len
-
                 next_id = next_ids[row : row + 1]
                 token_id = next_id.item()
                 req["ids"] = torch.cat([req["ids"], next_id], dim=1)
                 req["generated_tokens"] += 1
                 req["finished"] = token_id in stop_ids
                 update[request_id] = token_id
+
 
         # ----------------- 2. Decode 阶段 ------------------
         if decode_ids:
